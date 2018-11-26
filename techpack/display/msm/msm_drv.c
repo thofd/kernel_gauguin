@@ -973,11 +973,7 @@ static int msm_drm_init(struct device *dev, struct drm_driver *drv)
 		priv->fbdev = msm_fbdev_init(ddev);
 #endif
 
-	ret = sde_dbg_debugfs_register(dev);
-	if (ret) {
-		dev_err(dev, "failed to reg sde dbg debugfs: %d\n", ret);
-		goto fail;
-	}
+	sde_dbg_debugfs_register(dev);
 
 	/* perform subdriver post initialization */
 	if (kms && kms->funcs && kms->funcs->postinit) {
