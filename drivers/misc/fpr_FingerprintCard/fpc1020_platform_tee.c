@@ -19,11 +19,14 @@
  *
  *
  * Copyright (c) 2015 Fingerprint Cards AB <tech@fingerprints.com>
+ * Copyright (C) 2021 XiaoMi, Inc.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License Version 2
  * as published by the Free Software Foundation.
  */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/atomic.h>
 #include <linux/delay.h>
@@ -36,10 +39,14 @@
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
-#include <linux/pinctrl/consumer.h>
+#include <linux/pm_wakeup.h>
+#include <linux/pinctrl/qcom-pinctrl.h>
 
+#define FPC_GPIO_NO_DEFAULT -1
+#define FPC_GPIO_NO_DEFINED -2
+#define FPC_GPIO_REQUEST_FAIL -3
 
-#define FPC_TTW_HOLD_TIME		1000
+#define FPC_TTW_HOLD_TIME		2000
 #define RESET_LOW_SLEEP_MIN_US		5000
 #define RESET_LOW_SLEEP_MAX_US		(RESET_LOW_SLEEP_MIN_US + 100)
 #define RESET_HIGH_SLEEP1_MIN_US	100
@@ -57,7 +64,6 @@
 static const char * const pctl_names[] = {
 	"fpc1020_reset_reset",
 	"fpc1020_reset_active",
-	"fpc1020_irq_active",
 };
 
 struct vreg_config {
@@ -65,19 +71,22 @@ struct vreg_config {
 	unsigned long vmin;
 	unsigned long vmax;
 	int ua_load;
+	int gpio;
 };
 
-static const struct vreg_config vreg_conf[] = {
-	{ "vdd_ana", 1800000UL, 1800000UL, 6000, },
+static struct vreg_config vreg_conf[] = {
+	{ "vdd_ana", 1800000UL, 1800000UL, 6000, FPC_GPIO_NO_DEFAULT },
+/*
 	{ "vcc_spi", 1800000UL, 1800000UL, 10, },
 	{ "vdd_io", 1800000UL, 1800000UL, 6000, },
+*/
 };
 
 struct fpc1020_data {
 	struct device *dev;
 	struct pinctrl *fingerprint_pinctrl;
 	struct pinctrl_state *pinctrl_state[ARRAY_SIZE(pctl_names)];
-	struct regulator *vreg[ARRAY_SIZE(vreg_conf)];
+	// struct regulator *vreg[ARRAY_SIZE(vreg_conf)];
 	struct wakeup_source *ttw_wl;
 	struct mutex lock; /* To set/get exported values in sysfs */
 	int irq_gpio;
@@ -86,14 +95,143 @@ struct fpc1020_data {
 	int nbr_irqs_received_counter_start;
 	bool prepared;
 	atomic_t wakeup_enabled; /* Used both in ISR and non-ISR */
+	bool irq_requested;
+	bool gpios_requested;
+	int irqf;
 };
+
+/*
+ * request/release GPIO for voltage control.
+ *
+ */
+static int reset_gpio_res(struct fpc1020_data *fpc1020);
+static int request_vreg_gpio(struct fpc1020_data *fpc1020, bool enable);
+static int irq_setup(struct fpc1020_data *fpc1020, bool enable);
+static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
+		      bool enable);
+static irqreturn_t fpc1020_irq_handler(int irq, void *handle);
+static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
+				      const char *label, int *gpio);
+
+static int reset_gpio_res(struct fpc1020_data *fpc1020)
+{
+	int rc = 0;
+	struct device *dev;
+
+	if (!fpc1020) {
+		rc = -ENOMEM;
+		pr_err
+		    ("fpc %s: failed to allocate memory for struct fpc1020_data!\n",
+		     __func__);
+		return rc;
+	}
+
+	dev = fpc1020->dev;
+	fpc1020->irq_gpio = FPC_GPIO_NO_DEFAULT;
+
+	return rc;
+}
+
+static int request_vreg_gpio(struct fpc1020_data *fpc1020, bool enable)
+{
+	int rc = 0;
+	struct device *dev = fpc1020->dev;
+
+	dev_info(dev, "fpc %s --->: enter!\n", __func__);
+
+	mutex_lock(&fpc1020->lock);
+
+	if (enable && !fpc1020->gpios_requested) {
+		rc = fpc1020_request_named_gpio(fpc1020, "fpc,gpio_irq",
+						&fpc1020->irq_gpio);
+		if (rc) {
+			pr_err("fpc irq gpio request failed!\n");
+			goto release_irq_gpio;
+		} else {
+			dev_info(dev, "fpc irq gpio applied at  %d\n",
+				 fpc1020->irq_gpio);
+		}
+
+		dev_info(dev, "fpc irq gpio requested successfully!\n");
+
+		if (fpc1020->irq_requested) {
+			devm_free_irq(dev, gpio_to_irq(fpc1020->irq_gpio), fpc1020);
+			fpc1020->irq_requested = false;
+			dev_info(dev,
+				 "fpc irq has been requested already, free firstly!\n");
+		}
+
+		rc = devm_request_threaded_irq(dev,
+					       gpio_to_irq(fpc1020->irq_gpio),
+					       NULL, fpc1020_irq_handler,
+					       fpc1020->irqf, dev_name(dev),
+					       fpc1020);
+		if (rc) {
+			pr_err("fpc could not request irq %d\n",
+			       gpio_to_irq(fpc1020->irq_gpio));
+
+			goto release_irq_gpio;
+		}
+
+		fpc1020->irq_requested = true;
+		fpc1020->gpios_requested = true;
+		dev_info(dev, "fpc requested irq %d\n",
+			 gpio_to_irq(fpc1020->irq_gpio));
+	} else if (!enable && fpc1020->gpios_requested) {
+		if (fpc1020->irq_requested) {
+			devm_free_irq(dev, gpio_to_irq(fpc1020->irq_gpio),
+				      fpc1020);
+			dev_info(dev, "fpc irq free successfully!\n");
+			fpc1020->irq_requested = false;
+		}
+
+release_irq_gpio:
+		if (gpio_is_valid(fpc1020->irq_gpio)) {
+			devm_gpio_free(dev, fpc1020->irq_gpio);
+			fpc1020->irq_gpio = FPC_GPIO_NO_DEFAULT;
+			dev_info(dev, "fpc irq gpio released successfully!\n");
+		}
+
+		fpc1020->gpios_requested = false;
+	} else {
+		dev_info(dev, "%s: enable: %d, gpios_requested: %d ???\n",
+			 __func__, enable, fpc1020->gpios_requested);
+	}
+
+	mutex_unlock(&fpc1020->lock);
+	dev_info(dev, "fpc %s <---: exit!\n", __func__);
+	return rc;
+}
+
+static int irq_setup(struct fpc1020_data *fpc1020, bool enable)
+{
+	int rc = 0;
+	struct device *dev = fpc1020->dev;
+
+	if (gpio_is_valid(fpc1020->irq_gpio)) {
+		dev_info(dev, "fpc %s irq_gpio is validate!\n", __func__);
+		if (enable) {
+			enable_irq_wake(gpio_to_irq(fpc1020->irq_gpio));
+			dev_info(dev, "fpc irq_gpio is enable.\n");
+		} else {
+			disable_irq_wake(gpio_to_irq(fpc1020->irq_gpio));
+			dev_info(dev, "fpc irq_gpio is disable.\n");
+		}
+	} else {
+		dev_info(dev, "fpc %s irq_gpio is invalidate!\n", __func__);
+		return -EINVAL;
+	}
+
+	dev_info(dev, "fpc %s <---: exit!\n", __func__);
+	return rc;
+}
 
 static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
 	bool enable)
 {
 	size_t i;
-	int rc;
-	struct regulator *vreg;
+	int rc = 0;
+	int gpio = 0;
 	struct device *dev = fpc1020->dev;
 
 	for (i = 0; i < ARRAY_SIZE(vreg_conf); i++) {
@@ -108,6 +246,7 @@ static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
 	return -EINVAL;
 
 found:
+/*
 	vreg = fpc1020->vreg[i];
 	if (enable) {
 		if (!vreg) {
@@ -150,9 +289,45 @@ found:
 		}
 		rc = 0;
 	}
+*/
+	gpio = vreg_conf[i].gpio;
+
+	if(!gpio_is_valid(gpio)) {
+		dev_err(dev, "fpc %s: unable to get gpio %d!\n",
+			__func__, gpio);
+		return 0;
+	}
+
+	rc = gpio_direction_output(gpio, enable ? 1 : 0);
+	if (rc) {
+		dev_err(dev, "fpc %s: failed to set gpio %d to %d!\n", __func__, gpio, enable ? 1 : 0);
+		return rc;
+	}
 
 	return rc;
 }
+
+/*
+ * sysfs node for release GPIO.
+ *
+ */
+static ssize_t request_vreg_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int rc;
+	struct fpc1020_data *fpc1020 = dev_get_drvdata(dev);
+
+	if (!memcmp(buf, "enable", strlen("enable")))
+		rc = request_vreg_gpio(fpc1020, true);
+	else if (!memcmp(buf, "disable", strlen("disable")))
+		rc = request_vreg_gpio(fpc1020, false);
+	else
+		return -EINVAL;
+
+	return rc ? rc : count;
+}
+static DEVICE_ATTR_WO(request_vreg);
 
 /*
  * sysfs node for controlling clocks.
@@ -300,24 +475,38 @@ static void device_prepare(struct fpc1020_data *fpc1020, bool enable)
 {
 	mutex_lock(&fpc1020->lock);
 	if (enable && !fpc1020->prepared) {
-		fpc1020->prepared = true;
+		// fpc1020->prepared = true;
+		irq_setup(fpc1020, true);
 		select_pin_ctl(fpc1020, "fpc1020_reset_reset");
 
+/*
 		vreg_setup(fpc1020, "vcc_spi", true);
 		vreg_setup(fpc1020, "vdd_io", true);
 		vreg_setup(fpc1020, "vdd_ana", true);
+*/
 
 		usleep_range(PWR_ON_SLEEP_MIN_US, PWR_ON_SLEEP_MAX_US);
 
+		/* As we can't control chip select here the other part of the
+		 * sensor driver eg. the TEE driver needs to do a _SOFT_ reset
+		 * on the sensor after power up to be sure that the sensor is
+		 * in a good state after power up. Okeyed by ASIC.
+		 */
 		select_pin_ctl(fpc1020, "fpc1020_reset_active");
+		hw_reset(fpc1020);
+
+		fpc1020->prepared = true;
 	} else if (!enable && fpc1020->prepared) {
+		irq_setup(fpc1020, false);
 		select_pin_ctl(fpc1020, "fpc1020_reset_reset");
 
 		usleep_range(PWR_ON_SLEEP_MIN_US, PWR_ON_SLEEP_MAX_US);
 
+/*
 		vreg_setup(fpc1020, "vdd_ana", false);
 		vreg_setup(fpc1020, "vdd_io", false);
 		vreg_setup(fpc1020, "vcc_spi", false);
+*/
 
 		fpc1020->prepared = false;
 	}
@@ -357,12 +546,14 @@ static ssize_t wakeup_enable_store(struct device *dev,
 	ssize_t ret = count;
 
 	mutex_lock(&fpc1020->lock);
+/*
 	if (!memcmp(buf, "enable", strlen("enable")))
 		atomic_set(&fpc1020->wakeup_enabled, 1);
 	else if (!memcmp(buf, "disable", strlen("disable")))
 		atomic_set(&fpc1020->wakeup_enabled, 0);
 	else
 		ret = -EINVAL;
+*/
 	mutex_unlock(&fpc1020->lock);
 
 	return ret;
@@ -419,7 +610,29 @@ static ssize_t irq_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(irq);
 
+static ssize_t irq_enable_set(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	int rc = 0;
+	struct fpc1020_data *fpc1020 = dev_get_drvdata(dev);
+
+	mutex_lock(&fpc1020->lock);
+	if (!memcmp(buf, "1", strlen("1"))) {
+		enable_irq(gpio_to_irq(fpc1020->irq_gpio));
+	} else if (!memcmp(buf, "0", strlen("0"))) {
+		disable_irq(gpio_to_irq(fpc1020->irq_gpio));
+	}
+	mutex_unlock(&fpc1020->lock);
+
+	return rc ? rc : count;
+}
+
+static DEVICE_ATTR(irq_enable, S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP, NULL,
+		   irq_enable_set);
+
 static struct attribute *attributes[] = {
+	&dev_attr_request_vreg.attr,
 	&dev_attr_pinctl_set.attr,
 	&dev_attr_device_prepare.attr,
 	&dev_attr_regulator_enable.attr,
@@ -427,6 +640,7 @@ static struct attribute *attributes[] = {
 	&dev_attr_wakeup_enable.attr,
 	&dev_attr_handle_wakelock.attr,
 	&dev_attr_clk_enable.attr,
+	&dev_attr_irq_enable.attr,
 	&dev_attr_irq.attr,
 	NULL
 };
@@ -464,14 +678,14 @@ static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
 
 	if (rc < 0) {
 		dev_err(dev, "failed to get '%s'\n", label);
-		return rc;
+		return FPC_GPIO_NO_DEFINED;
 	}
 	*gpio = rc;
 
 	rc = devm_gpio_request(dev, *gpio, label);
 	if (rc) {
 		dev_err(dev, "failed to request gpio %d\n", *gpio);
-		return rc;
+		return FPC_GPIO_REQUEST_FAIL;
 	}
 	dev_dbg(dev, "%s %d\n", label, *gpio);
 
@@ -484,7 +698,6 @@ static int fpc1020_probe(struct platform_device *pdev)
 	struct fpc1020_data *fpc1020;
 	int rc;
 	size_t i;
-	int irqf = 0;
 
 	fpc1020 = devm_kzalloc(dev, sizeof(*fpc1020), GFP_KERNEL);
 	if (!fpc1020)
@@ -493,6 +706,7 @@ static int fpc1020_probe(struct platform_device *pdev)
 	fpc1020->dev = dev;
 	platform_set_drvdata(pdev, fpc1020);
 
+/*
 	rc = fpc1020_request_named_gpio(fpc1020, "fpc,gpio_irq",
 			&fpc1020->irq_gpio);
 	if (rc)
@@ -501,15 +715,23 @@ static int fpc1020_probe(struct platform_device *pdev)
 			&fpc1020->rst_gpio);
 	if (rc)
 		return -EINVAL;
+*/
 
 	fpc1020->fingerprint_pinctrl = devm_pinctrl_get(dev);
 	if (IS_ERR(fpc1020->fingerprint_pinctrl)) {
 		rc = PTR_ERR(fpc1020->fingerprint_pinctrl);
+		if (rc == -EPROBE_DEFER) {
+			dev_info(dev, "pinctrl not ready\n");
+			return rc;
+		}
 		dev_err(dev, "Cannot get pinctrl\n", rc);
 		return rc;
+		// fpc1020->fingerprint_pinctrl = NULL;
+		//return -EINVAL;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(pctl_names); i++) {
+	// for (i = 0; i < ARRAY_SIZE(fpc1020->pinctrl_state); i++) {
 		const char *n = pctl_names[i];
 		struct pinctrl_state *state =
 			pinctrl_lookup_state(fpc1020->fingerprint_pinctrl, n);
@@ -521,17 +743,28 @@ static int fpc1020_probe(struct platform_device *pdev)
 		fpc1020->pinctrl_state[i] = state;
 	}
 
+/*
 	select_pin_ctl(fpc1020, "fpc1020_reset_reset");
 	select_pin_ctl(fpc1020, "fpc1020_irq_active");
 
 	atomic_set(&fpc1020->wakeup_enabled, 0);
+*/
 
+	atomic_set(&fpc1020->wakeup_enabled, 1);
+
+	fpc1020->irqf = IRQF_TRIGGER_RISING | IRQF_ONESHOT;
+	fpc1020->irq_requested = false;
+	fpc1020->gpios_requested = false;
+	device_init_wakeup(dev, 1);
+/*
 	if (of_property_read_bool(dev->of_node, "fpc,enable-wakeup")) {
 		irqf = IRQF_NO_SUSPEND;
 		device_init_wakeup(dev, 1);
 	}
+*/
 
 	mutex_init(&fpc1020->lock);
+/*
 	rc = devm_request_threaded_irq(dev, gpio_to_irq(fpc1020->irq_gpio),
 			NULL, fpc1020_irq_handler,
 			irqf | IRQF_TRIGGER_RISING | IRQF_ONESHOT,
@@ -545,6 +778,7 @@ static int fpc1020_probe(struct platform_device *pdev)
 	dev_dbg(dev, "requested irq %d\n", gpio_to_irq(fpc1020->irq_gpio));
 
 	enable_irq_wake(gpio_to_irq(fpc1020->irq_gpio));
+*/
 
 	fpc1020->ttw_wl = wakeup_source_register(dev, "fpc_ttw_wl");
 	if (!fpc1020->ttw_wl)
@@ -556,12 +790,24 @@ static int fpc1020_probe(struct platform_device *pdev)
 		return rc;
 	}
 
+	rc = reset_gpio_res(fpc1020);
+	if (rc) {
+		dev_err(dev, "fpc %s: could not initialize GPIOs No.!\n",
+			__func__);
+		return rc;
+	}
+
 	if (of_property_read_bool(dev->of_node, "fpc,enable-on-boot")) {
 		dev_dbg(dev, "Enabling hardware\n");
 		device_prepare(fpc1020, true);
 	}
 
-	hw_reset(fpc1020);
+	// hw_reset(fpc1020);
+
+	if (msm_gpio_mpm_wake_set(17, true))
+		dev_info(dev, "%s: GPIO 17 wake set failed!\n", __func__);
+	else
+		dev_info(dev, "%s: GPIO 17 wake set success!\n", __func__);
 
 	return 0;
 }
@@ -573,14 +819,17 @@ static int fpc1020_remove(struct platform_device *pdev)
 	sysfs_remove_group(&pdev->dev.kobj, &attribute_group);
 	mutex_destroy(&fpc1020->lock);
 	wakeup_source_unregister(fpc1020->ttw_wl);
+	(void)reset_gpio_res(fpc1020);
+/*
 	vreg_setup(fpc1020, "vdd_ana", false);
 	vreg_setup(fpc1020, "vdd_io", false);
 	vreg_setup(fpc1020, "vcc_spi", false);
+*/
 
 	return 0;
 }
 
-static const struct of_device_id fpc1020_of_match[] = {
+static struct of_device_id fpc1020_of_match[] = {
 	{ .compatible = "fpc,fpc1020", },
 	{}
 };
