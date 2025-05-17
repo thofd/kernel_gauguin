@@ -766,6 +766,7 @@
 	fingerprint_fpc {
                status = "ok";
                compatible = "fpc,fpc1020";
+               fpc,enable-wakeup;
                fpc,gpio_rst    = <&tlmm 18 0x0>;
                fpc,gpio_irq    = <&tlmm 17 0x0>;
                pinctrl-names = "fpc1020_reset_reset",

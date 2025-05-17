@@ -104,11 +104,6 @@ struct fpc1020_data {
  * request/release GPIO for voltage control.
  *
  */
-static int reset_gpio_res(struct fpc1020_data *fpc1020);
-static int request_vreg_gpio(struct fpc1020_data *fpc1020, bool enable);
-static int irq_setup(struct fpc1020_data *fpc1020, bool enable);
-static int vreg_setup(struct fpc1020_data *fpc1020, const char *name,
-		      bool enable);
 static irqreturn_t fpc1020_irq_handler(int irq, void *handle);
 static int fpc1020_request_named_gpio(struct fpc1020_data *fpc1020,
 				      const char *label, int *gpio);
@@ -161,11 +156,10 @@ static int request_vreg_gpio(struct fpc1020_data *fpc1020, bool enable)
 				 "fpc irq has been requested already, free firstly!\n");
 		}
 
-		rc = devm_request_threaded_irq(dev,
-					       gpio_to_irq(fpc1020->irq_gpio),
-					       NULL, fpc1020_irq_handler,
-					       fpc1020->irqf, dev_name(dev),
-					       fpc1020);
+		rc = devm_request_threaded_irq(dev, gpio_to_irq(fpc1020->irq_gpio),
+					NULL, fpc1020_irq_handler,
+					fpc1020->irqf | IRQF_TRIGGER_RISING | IRQF_ONESHOT, dev_name(dev),
+					fpc1020);
 		if (rc) {
 			pr_err("fpc could not request irq %d\n",
 			       gpio_to_irq(fpc1020->irq_gpio));
@@ -475,7 +469,7 @@ static void device_prepare(struct fpc1020_data *fpc1020, bool enable)
 {
 	mutex_lock(&fpc1020->lock);
 	if (enable && !fpc1020->prepared) {
-		// fpc1020->prepared = true;
+		fpc1020->prepared = true;
 		irq_setup(fpc1020, true);
 		select_pin_ctl(fpc1020, "fpc1020_reset_reset");
 
@@ -495,7 +489,7 @@ static void device_prepare(struct fpc1020_data *fpc1020, bool enable)
 		select_pin_ctl(fpc1020, "fpc1020_reset_active");
 		hw_reset(fpc1020);
 
-		fpc1020->prepared = true;
+		//fpc1020->prepared = true;
 	} else if (!enable && fpc1020->prepared) {
 		irq_setup(fpc1020, false);
 		select_pin_ctl(fpc1020, "fpc1020_reset_reset");
@@ -546,14 +540,12 @@ static ssize_t wakeup_enable_store(struct device *dev,
 	ssize_t ret = count;
 
 	mutex_lock(&fpc1020->lock);
-/*
 	if (!memcmp(buf, "enable", strlen("enable")))
 		atomic_set(&fpc1020->wakeup_enabled, 1);
 	else if (!memcmp(buf, "disable", strlen("disable")))
 		atomic_set(&fpc1020->wakeup_enabled, 0);
 	else
 		ret = -EINVAL;
-*/
 	mutex_unlock(&fpc1020->lock);
 
 	return ret;
@@ -747,24 +739,24 @@ static int fpc1020_probe(struct platform_device *pdev)
 	select_pin_ctl(fpc1020, "fpc1020_reset_reset");
 	select_pin_ctl(fpc1020, "fpc1020_irq_active");
 
-	atomic_set(&fpc1020->wakeup_enabled, 0);
 */
+	atomic_set(&fpc1020->wakeup_enabled, 0);
+	// atomic_set(&fpc1020->wakeup_enabled, 1);
 
-	atomic_set(&fpc1020->wakeup_enabled, 1);
-
-	fpc1020->irqf = IRQF_TRIGGER_RISING | IRQF_ONESHOT;
+	// fpc1020->irqf = IRQF_TRIGGER_RISING | IRQF_ONESHOT;
 	fpc1020->irq_requested = false;
 	fpc1020->gpios_requested = false;
-	device_init_wakeup(dev, 1);
-/*
+	// device_init_wakeup(dev, 1);
+
 	if (of_property_read_bool(dev->of_node, "fpc,enable-wakeup")) {
-		irqf = IRQF_NO_SUSPEND;
+		fpc1020->irqf = IRQF_NO_SUSPEND;
 		device_init_wakeup(dev, 1);
 	}
-*/
 
 	mutex_init(&fpc1020->lock);
+
 /*
+// below changes are now handled in request_vreg_gpio()
 	rc = devm_request_threaded_irq(dev, gpio_to_irq(fpc1020->irq_gpio),
 			NULL, fpc1020_irq_handler,
 			irqf | IRQF_TRIGGER_RISING | IRQF_ONESHOT,
@@ -777,6 +769,7 @@ static int fpc1020_probe(struct platform_device *pdev)
 
 	dev_dbg(dev, "requested irq %d\n", gpio_to_irq(fpc1020->irq_gpio));
 
+// below change is handled in irq_setup()
 	enable_irq_wake(gpio_to_irq(fpc1020->irq_gpio));
 */
 
